@@ -189,9 +189,36 @@ class BigQueryConnector(SQLConnector):
             return jsonschema.type_dict
         return super().to_jsonschema_type(sql_type)
 
-    # TODO this only needs a column filtering capability in the singer-sdk
-    # as sqlalchemy returns additional columns on bigquery for all the json
-    # it has natively understood.
+    def discover_catalog_entries(
+        self,
+        *,
+        exclude_schemas: t.Sequence[str] = (),
+        reflect_indices: bool = True,
+    ) -> list[dict]:
+        """Override to avoid get_multi_columns which breaks with user_supplied_client.
+
+        sqlalchemy-bigquery's get_multi_columns uses the schema name as
+        the project in the API URL, causing 400 errors. This override
+        uses per-table get_columns which resolves the project correctly.
+        """
+        result: list[dict] = []
+        engine = self._engine
+        inspected = sqlalchemy.inspect(engine)
+
+        for schema_name in self.get_schema_names(engine, inspected):
+            if schema_name in exclude_schemas:
+                continue
+
+            object_names = self.get_object_names(engine, inspected, schema_name)
+
+            for table_name, is_view in object_names:
+                catalog_entry = self.discover_catalog_entry(
+                    engine, inspected, schema_name, table_name, is_view,
+                )
+                result.append(catalog_entry.to_dict())
+
+        return result
+
     def discover_catalog_entry(
         self,
         engine: Engine,  # noqa: ARG002
