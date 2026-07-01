@@ -1,4 +1,4 @@
-"""A sample implementation for BigQuery."""
+"""BigQuery connector implementation."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import json
 import typing as t
 
 import sqlalchemy
+from google.cloud import bigquery
+from google.oauth2.credentials import Credentials as OAuthCredentials
 from singer_sdk import SQLConnector
 from singer_sdk import typing as th  # JSON schema typing helpers
 from singer_sdk._singerlib import CatalogEntry, MetadataMapping, Schema
@@ -40,42 +42,72 @@ class BigQueryConnector(SQLConnector):
         on their subclass of SQLConnector to perform custom engine creation
         logic.
 
+        Supports two auth modes (controlled by auth_type config):
+        - service_account (default): uses google_application_credentials
+        - oauth: uses access_token passed from Argo via DAG env vars
+
         Returns:
             A new SQLAlchemy Engine.
         """
-        credentials : str | dict = self.config.get("google_application_credentials")
+        auth_type = self.config.get("auth_type", "service_account")
+
+        bq_client = self._create_bigquery_client(auth_type)
+        url = self.sqlalchemy_url + "?user_supplied_client=true"
+        return sqlalchemy.create_engine(
+            url,
+            echo=False,
+            connect_args={"client": bq_client},
+        )
+
+    def _create_bigquery_client(self, auth_type: str) -> bigquery.Client:
+        """Create a BigQuery client based on auth_type.
+
+        Auth modes:
+        - oauth: Uses client_id, client_secret, refresh_token to obtain
+          and auto-refresh access tokens. Same pattern as mk-tap-salesforce
+          and mk-tap-hubspot.
+        - service_account: Uses google_application_credentials JSON.
+        - Falls back to Application Default Credentials if nothing is configured.
+
+        Returns:
+            Authenticated BigQuery client.
+        """
+        project_id = self.config["project_id"]
+
+        if auth_type == "oauth":
+            client_id = self.config.get("client_id")
+            client_secret = self.config.get("client_secret")
+            refresh_token = self.config.get("refresh_token")
+            if not all([client_id, client_secret, refresh_token]):
+                msg = (
+                    "client_id, client_secret, and refresh_token are all required "
+                    "when auth_type is 'oauth'"
+                )
+                raise RuntimeError(msg)
+            oauth_creds = OAuthCredentials(
+                token=None,
+                refresh_token=refresh_token,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=client_id,
+                client_secret=client_secret,
+                scopes=["https://www.googleapis.com/auth/bigquery"],
+            )
+            return bigquery.Client(project=project_id, credentials=oauth_creds)
+
+        credentials: str | dict = self.config.get("google_application_credentials")
 
         if credentials:
-            try:
-                return sqlalchemy.create_engine(
-                    self.sqlalchemy_url,
-                    echo=False,
-                    credentials_info=(
-                        json.loads(credentials)
-                        if isinstance(credentials, str)
-                        else credentials
-                    ),
-                    # json_serializer=self.serialize_json,
-                    # json_deserializer=self.deserialize_json,
-                )
-            except (TypeError, json.decoder.JSONDecodeError):
-                self.logger.warning(
-                    "'google_application_credentials' not valid json trying path",
-                )
-                return sqlalchemy.create_engine(
-                    self.sqlalchemy_url,
-                    echo=False,
-                    credentials_path=credentials,
-                    # json_serializer=self.serialize_json,
-                    # json_deserializer=self.deserialize_json,
-                )
-        else:
-            return sqlalchemy.create_engine(
-                self.sqlalchemy_url,
-                echo=False,
-                # json_serializer=self.serialize_json,
-                # json_deserializer=self.deserialize_json,
+            creds_dict = (
+                json.loads(credentials) if isinstance(credentials, str) else credentials
             )
+            creds_dict.setdefault("type", "service_account")
+            creds_dict.setdefault("token_uri", "https://oauth2.googleapis.com/token")
+            return bigquery.Client.from_service_account_info(
+                creds_dict,
+                project=project_id,
+            )
+
+        return bigquery.Client(project=project_id)
 
     def to_array_type(
         self,

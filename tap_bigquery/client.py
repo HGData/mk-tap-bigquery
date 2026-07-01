@@ -5,7 +5,6 @@ This includes BigQueryStream and BigQueryConnector.
 
 from __future__ import annotations
 
-import json
 import math
 import tempfile
 from functools import cached_property
@@ -30,20 +29,10 @@ class BigQueryStream(SQLStream):
 
     @cached_property
     def client(self):
-        credentials: str | dict = self.config["google_application_credentials"]
-
-        try:
-            return bigquery.Client.from_service_account_info(
-                json.loads(credentials)
-                if isinstance(credentials, str)
-                else credentials,
-            )
-        except (TypeError, json.decoder.JSONDecodeError):
-            self.logger.debug(
-                "`google_application_credentials` is not valid JSON, trying as path",
-            )
-
-        return bigquery.Client.from_service_account_json(credentials)
+        """Create a BigQuery client, reusing the connector's auth logic."""
+        return self.connector._create_bigquery_client(
+            self.config.get("auth_type", "service_account"),
+        )
 
     def prepare_serialisation(self, _dict, _keychain = []):
         """
