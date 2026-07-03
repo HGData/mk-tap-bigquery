@@ -258,12 +258,14 @@ class BigQueryConnector(SQLConnector):
 
         key_properties = next(iter(possible_primary_keys), None)
 
-        # Initialize columns list
+        # Initialize columns list and detect timestamp columns for incremental
         table_schema = th.PropertiesList()
+        timestamp_columns: list[str] = []
         for column_def in inspected.get_columns(table_name, schema=schema_name):
             column_name = column_def["name"]
             is_nullable = column_def.get("nullable", False)
-            jsonschema_type: dict = self.to_jsonschema_type(column_name, column_def["type"])
+            col_type = column_def["type"]
+            jsonschema_type: dict = self.to_jsonschema_type(column_name, col_type)
             if ("." not in column_name):
                 table_schema.append(
                     th.Property(
@@ -273,16 +275,37 @@ class BigQueryConnector(SQLConnector):
                         required=column_name in key_properties if key_properties else False,
                     ),
                 )
+                type_name = type(col_type).__name__.upper()
+                if type_name in ("TIMESTAMP", "DATETIME", "DATE"):
+                    timestamp_columns.append(column_name)
         schema = table_schema.to_dict()
 
-        # Initialize available replication methods
-        addl_replication_methods: list[str] = [""]  # By default an empty list.
-        # Notes regarding replication methods:
-        # - 'INCREMENTAL' replication must be enabled by the user by specifying
-        #   a replication_key value.
-        # - 'LOG_BASED' replication must be enabled by the developer, according
-        #   to source-specific implementation capabilities.
-        replication_method = next(reversed(["FULL_TABLE", *addl_replication_methods]))
+        # Determine replication method and key.
+        # If the user specified a replication_key_column in config, use it.
+        # Otherwise auto-detect from timestamp columns with well-known names.
+        configured_key = self.config.get("replication_key_column")
+        replication_key: str | None = None
+        valid_replication_keys: list[str] | None = None
+
+        if timestamp_columns:
+            valid_replication_keys = timestamp_columns
+            if configured_key and configured_key in timestamp_columns:
+                replication_key = configured_key
+            else:
+                # Auto-detect: prefer well-known column names
+                preferred = [
+                    "updated_at", "modified_at", "last_modified",
+                    "_sdc_batched_at", "created_at",
+                ]
+                for name in preferred:
+                    if name in timestamp_columns:
+                        replication_key = name
+                        break
+
+        if replication_key:
+            replication_method = "INCREMENTAL"
+        else:
+            replication_method = "FULL_TABLE"
 
         # Create the catalog entry object
         return CatalogEntry(
@@ -298,12 +321,12 @@ class BigQueryConnector(SQLConnector):
                 schema=schema,
                 replication_method=replication_method,
                 key_properties=key_properties,
-                valid_replication_keys=None,  # Must be defined by user
+                valid_replication_keys=valid_replication_keys,
             ),
             database=None,  # Expects single-database context
             row_count=None,
             stream_alias=None,
-            replication_key=None,  # Must be defined by user
+            replication_key=replication_key,
         )
 
     def get_sqlalchemy_url(self, config: dict) -> str:

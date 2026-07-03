@@ -133,6 +133,25 @@ class BigQueryStream(SQLStream):
         yield JSONLinesEncoding("gzip"), [f.as_uri() for f in files]
 
     def _build_extract_query(self):
+        expressions = _generate_property_expressions(
+            self.get_selected_schema()["properties"],
+        )
+
+        where_clause = ""
+        if self.replication_key:
+            start_value = self.get_starting_replication_key_value(None)
+            if start_value:
+                self.logger.info(
+                    "Incremental extract: %s >= '%s'",
+                    self.replication_key,
+                    start_value,
+                )
+                where_clause = (
+                    f"WHERE {self.replication_key} >= "
+                    f"TIMESTAMP('{start_value}') "
+                    f"OR {self.replication_key} IS NULL"
+                )
+
         query = """
         EXPORT DATA
             OPTIONS (
@@ -144,17 +163,15 @@ class BigQueryStream(SQLStream):
         AS (
             SELECT {expressions}
             FROM {table}
+            {where_clause}
         )
         """
-
-        expressions = _generate_property_expressions(
-            self.get_selected_schema()["properties"],
-        )
 
         return query.format(
             bucket=self.config["google_storage_bucket"],
             table=self.fully_qualified_name,
             expressions=", ".join(expressions),
+            where_clause=where_clause,
         )
 
 
