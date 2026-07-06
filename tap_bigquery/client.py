@@ -147,7 +147,7 @@ class BigQueryStream(SQLStream):
                     start_value,
                 )
                 where_clause = (
-                    f"WHERE {self.replication_key} >= "
+                    f"WHERE {self.replication_key} > "
                     f"TIMESTAMP('{start_value}') "
                     f"OR {self.replication_key} IS NULL"
                 )
