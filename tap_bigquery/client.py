@@ -11,6 +11,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import sqlalchemy
 from gcsfs import GCSFileSystem
 from google.cloud import bigquery
 from singer_sdk import SQLStream
@@ -73,6 +74,38 @@ class BigQueryStream(SQLStream):
         context: types.Context | None = None,  # noqa: ARG002
     ) -> dict | None:
         return self.prepare_serialisation(row)
+
+    def get_records(self, context):
+        """Use strict > for replication key to avoid re-pulling records at the bookmark boundary.
+
+        Overrides singer-sdk's default >= comparison, which causes all records to be
+        re-pulled every run when source rows share a uniform batch timestamp (e.g.,
+        50k events all loaded with the same updated_at).
+        """
+        start_value = self.get_starting_replication_key_value(context)
+
+        if not self.replication_key or not start_value:
+            yield from super().get_records(context)
+            return
+
+        self.logger.info(
+            "Incremental extract: %s > '%s'",
+            self.replication_key,
+            start_value,
+        )
+
+        query = sqlalchemy.text(
+            f"SELECT * FROM {self.fully_qualified_name} "
+            f"WHERE {self.replication_key} > TIMESTAMP('{start_value}') "
+            f"OR {self.replication_key} IS NULL"
+        )
+
+        with self.connector._engine.connect() as conn:
+            for row in conn.execute(query):
+                record = dict(row._mapping)
+                transformed = self.post_process(record, context)
+                if transformed is not None:
+                    yield transformed
 
     def get_batch_config(self, config):
         return config.get("google_storage_bucket")
