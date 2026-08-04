@@ -75,13 +75,26 @@ class BigQueryStream(SQLStream):
     ) -> dict | None:
         return self.prepare_serialisation(row)
 
-    def get_records(self, context):
+    def get_records(
+        self,
+        context: types.Context | None = None,
+        *,
+        partition: types.Context | None = None,
+    ):
         """Use strict > for replication key to avoid re-pulling records at the bookmark boundary.
 
         Overrides singer-sdk's default >= comparison, which causes all records to be
         re-pulled every run when source rows share a uniform batch timestamp (e.g.,
         50k events all loaded with the same updated_at).
+
+        Args:
+            context: Stream partition context, passed positionally by the SDK.
+            partition: Legacy alias for ``context``, kept for callers that still
+                use the older keyword name.
         """
+        if context is None:
+            context = partition
+
         start_value = self.get_starting_replication_key_value(context)
 
         if not self.replication_key or not start_value:
@@ -175,7 +188,7 @@ class BigQueryStream(SQLStream):
             start_value = self.get_starting_replication_key_value(None)
             if start_value:
                 self.logger.info(
-                    "Incremental extract: %s >= '%s'",
+                    "Incremental extract: %s > '%s'",
                     self.replication_key,
                     start_value,
                 )

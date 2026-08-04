@@ -91,9 +91,10 @@ class TapBigQuery(SQLTap):
             description=(
                 "Name of a TIMESTAMP column to use as the replication key for "
                 "incremental extraction (e.g. 'updated_at'). When set, the tap "
-                "extracts only records where this column >= the last bookmark. "
-                "If not set, the tap auto-detects from well-known column names "
-                "(updated_at, modified_at, etc.) or falls back to FULL_TABLE."
+                "extracts only records where this column > the last bookmark, "
+                "plus records where it is NULL. If not set, the tap auto-detects "
+                "from well-known column names (updated_at, modified_at, etc.) or "
+                "falls back to FULL_TABLE."
             ),
         ),
     ).to_dict()

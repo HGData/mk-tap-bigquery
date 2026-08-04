@@ -27,6 +27,15 @@ class TestCore(unittest.TestCase):
 
     def setUp(self):
         self.mock_config = SAMPLE_CONFIG
+        # Building a real bigquery.Client would need real credentials, so stub it
+        # out. Auth selection itself is covered by tests/test_connector_auth.py.
+        patcher = mock.patch.object(
+            BigQueryConnector,
+            "_create_bigquery_client",
+            return_value=mock.MagicMock(),
+        )
+        self.addCleanup(patcher.stop)
+        patcher.start()
 
     # Run standard built-in tap tests from the SDK:
     @mock.patch("sqlalchemy.create_engine", return_value=create_mock_engine('bigquery://mockprojectid', dump))

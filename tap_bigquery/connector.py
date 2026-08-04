@@ -66,7 +66,8 @@ class BigQueryConnector(SQLConnector):
         - oauth: Uses client_id, client_secret, refresh_token to obtain
           and auto-refresh access tokens. Same pattern as mk-tap-salesforce
           and mk-tap-hubspot.
-        - service_account: Uses google_application_credentials JSON.
+        - service_account: Uses google_application_credentials, which may hold
+          either the key JSON itself or a path to a key file.
         - Falls back to Application Default Credentials if nothing is configured.
 
         Returns:
@@ -97,9 +98,27 @@ class BigQueryConnector(SQLConnector):
         credentials: str | dict = self.config.get("google_application_credentials")
 
         if credentials:
-            creds_dict = (
-                json.loads(credentials) if isinstance(credentials, str) else credentials
-            )
+            creds_dict: dict | None = None
+
+            if isinstance(credentials, dict):
+                creds_dict = credentials
+            else:
+                try:
+                    parsed = json.loads(credentials)
+                except (TypeError, json.decoder.JSONDecodeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    creds_dict = parsed
+
+            if creds_dict is None:
+                self.logger.warning(
+                    "'google_application_credentials' not valid json trying path",
+                )
+                return bigquery.Client.from_service_account_json(
+                    credentials,
+                    project=project_id,
+                )
+
             creds_dict.setdefault("type", "service_account")
             creds_dict.setdefault("token_uri", "https://oauth2.googleapis.com/token")
             return bigquery.Client.from_service_account_info(
