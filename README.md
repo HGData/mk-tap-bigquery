@@ -144,12 +144,27 @@ The same filter is applied on both extract paths: the row-by-row path and the
 bound as a query parameter typed from the column itself, so a DATE or DATETIME key is
 compared against a matching literal rather than a TIMESTAMP, which BigQuery rejects.
 
-On the batch path the tap reads `MAX(<key>)` before exporting and commits it as the new
-bookmark only once the export and download have succeeded. The SDK does not advance
-bookmarks for `BATCH` streams on its own, so without this every run would re-export the
-same delta. Because the watermark is read before the export, rows committed in between
-are exported and then exported again on the next run — at-least-once, which downstream
-de-duplication absorbs.
+The row-by-row path needs no upper bound: a single BigQuery `SELECT` reads a consistent
+snapshot taken at job start, so its result set cannot grow while it is being read.
+
+The batch path does bound itself, because it issues two jobs and therefore sees two
+snapshots. It reads `MAX(<key>)` first, exports only up to that ceiling, and commits it
+as the new bookmark once the export and download have succeeded:
+
+```sql
+WHERE (updated_at > @bookmark AND updated_at <= @watermark) OR updated_at IS NULL
+```
+
+The exported window therefore matches the committed bookmark exactly — rows committed
+between the two jobs are left for the next run rather than exported twice or skipped.
+The SDK does not advance bookmarks for `BATCH` streams on its own, so without this the
+bookmark would never move and every run would re-export the same delta.
+
+Rows whose replication key is NULL are counted and reported in a single warning per run.
+They are re-extracted every run, since a NULL key gives no way to tell whether they
+changed. Excluding them would be worse — they would never be extracted at all, which
+silently drops rows in the common case where a source leaves `updated_at` NULL until the
+first update. If the warning shows a persistent count, the fix belongs in the source.
 
 ## Usage
 

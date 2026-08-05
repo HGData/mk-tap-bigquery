@@ -22,8 +22,9 @@ from tap_bigquery.connector import REPLICATION_KEY_TYPES, BigQueryConnector
 if TYPE_CHECKING:
     from singer_sdk.helpers import types
 
-# Name of the named query parameter carrying the incremental bookmark.
+# Names of the query parameters bounding an incremental extract.
 BOOKMARK_PARAMETER = "bookmark"
+WATERMARK_PARAMETER = "watermark"
 
 
 def quote_identifier(name: str) -> str:
@@ -130,13 +131,42 @@ class BigQueryStream(SQLStream):
 
         query = self._build_incremental_query(start_value)
 
+        # A single BigQuery SELECT reads a consistent snapshot taken at job start,
+        # so this result set cannot grow while it is being read and needs no upper
+        # bound. The batch path issues two jobs and does bound itself - see
+        # get_batches.
+        null_key_count = 0
+
         # _connect() is what applies stream_results=True, so results are not
         # buffered in memory for large extracts.
         with self.connector._connect() as conn:  # noqa: SLF001
             for record in conn.execute(query).mappings():
+                if record[self.replication_key] is None:
+                    null_key_count += 1
                 transformed = self.post_process(dict(record), context)
                 if transformed is not None:
                     yield transformed
+
+        self._warn_about_null_replication_keys(null_key_count)
+
+    def _warn_about_null_replication_keys(self, count: int) -> None:
+        """Log once about rows that cannot ever advance the bookmark.
+
+        Such rows are re-extracted on every run, because a NULL key gives no way
+        to tell whether they changed. Excluding them instead would drop them from
+        the extract permanently, so the cost is surfaced here rather than hidden.
+
+        Args:
+            count: Number of rows extracted with a NULL replication key.
+        """
+        if count:
+            self.logger.warning(
+                "%d row(s) in '%s' have a NULL %s and are re-extracted on every "
+                "run; the source should populate this column",
+                count,
+                self.fully_qualified_name,
+                self.replication_key,
+            )
 
     def _build_incremental_query(self, start_value):
         """Build the SELECT for an incremental row-by-row extract.
@@ -196,13 +226,15 @@ class BigQueryStream(SQLStream):
             bucket,
         )
 
-        # Capture the ceiling before exporting. Rows committed between this query
-        # and the export still get exported, and will be exported again next run
-        # because the bookmark stays behind them - at-least-once, which downstream
-        # dedup absorbs. Reading the watermark afterwards could skip rows instead.
-        watermark = self._get_replication_key_watermark()
+        # The stats query and the export are two separate jobs, so they see two
+        # separate snapshots. Reading the ceiling first and then exporting only up
+        # to it makes the exported window exactly match the bookmark committed
+        # below: rows committed in between are left for the next run rather than
+        # being exported twice or skipped.
+        watermark, null_key_count = self._read_replication_key_stats()
+        self._warn_about_null_replication_keys(null_key_count)
 
-        query, query_parameters = self._build_extract_query()
+        query, query_parameters = self._build_extract_query(watermark)
         self.logger.debug(query)
 
         extract_job = self.client.query(
@@ -268,25 +300,36 @@ class BigQueryStream(SQLStream):
         type_name = type(table.columns[self.replication_key].type).__name__.upper()
         return type_name if type_name in REPLICATION_KEY_TYPES else "TIMESTAMP"
 
-    def _get_replication_key_watermark(self):
-        """Return MAX(replication_key) for the table, or None.
+    def _read_replication_key_stats(self):
+        """Return (MAX(replication_key), count of NULL replication keys).
+
+        Both come from one job, so bounding the export costs no extra query.
 
         Returns:
-            The highest replication key value present, or None when the stream is
-            not incremental or the table holds no non-NULL values.
+            A tuple of the highest replication key value present - None when the
+            stream is not incremental or holds no non-NULL values - and the number
+            of rows whose replication key is NULL.
         """
         if not self.replication_key:
-            return None
+            return None, 0
 
+        column = quote_identifier(self.replication_key)
         query = (
-            f"SELECT MAX({quote_identifier(self.replication_key)}) AS watermark "
+            f"SELECT MAX({column}) AS watermark, "
+            f"COUNTIF({column} IS NULL) AS null_keys "
             f"FROM {quote_identifier(self.fully_qualified_name)}"
         )
         rows = list(self.client.query(query).result())
-        return rows[0]["watermark"] if rows else None
+        if not rows:
+            return None, 0
+        return rows[0]["watermark"], rows[0]["null_keys"]
 
-    def _build_extract_query(self):
+    def _build_extract_query(self, watermark=None):
         """Build the EXPORT DATA statement and its query parameters.
+
+        Args:
+            watermark: Optional upper bound; rows above it are left for the next
+                run so the exported window matches the bookmark that gets committed.
 
         Returns:
             A tuple of the SQL statement and the list of query parameters it binds.
@@ -298,24 +341,43 @@ class BigQueryStream(SQLStream):
         where_clause = ""
         query_parameters: list = []
         if self.replication_key:
+            column = quote_identifier(self.replication_key)
+            parameter_type = None
+            bounds = []
+
             start_value = self.get_starting_replication_key_value(None)
             if start_value:
-                self.logger.info(
-                    "Incremental extract: %s > '%s' (or NULL)",
-                    self.replication_key,
-                    start_value,
-                )
-                column = quote_identifier(self.replication_key)
-                where_clause = (
-                    f"WHERE {column} > @{BOOKMARK_PARAMETER} "
-                    f"OR {column} IS NULL"
-                )
+                parameter_type = self._replication_key_parameter_type()
+                bounds.append(f"{column} > @{BOOKMARK_PARAMETER}")
                 query_parameters.append(
                     bigquery.ScalarQueryParameter(
                         BOOKMARK_PARAMETER,
-                        self._replication_key_parameter_type(),
+                        parameter_type,
                         start_value,
                     ),
+                )
+
+            if watermark is not None:
+                if parameter_type is None:
+                    parameter_type = self._replication_key_parameter_type()
+                bounds.append(f"{column} <= @{WATERMARK_PARAMETER}")
+                query_parameters.append(
+                    bigquery.ScalarQueryParameter(
+                        WATERMARK_PARAMETER,
+                        parameter_type,
+                        watermark,
+                    ),
+                )
+
+            if bounds:
+                self.logger.info(
+                    "Incremental extract: %s > '%s' and <= '%s' (or NULL)",
+                    self.replication_key,
+                    start_value,
+                    watermark,
+                )
+                where_clause = (
+                    f"WHERE ({' AND '.join(bounds)}) OR {column} IS NULL"
                 )
 
         query = """

@@ -15,6 +15,7 @@ from tap_bigquery.tap import TapBigQuery
 from tests.utils.mockinspector import MockInspector
 
 BOOKMARK = "2026-01-01T00:00:00+00:00"
+WATERMARK = "2026-06-01T00:00:00+00:00"
 STREAM_NAME = "mock-schema-mock_table"
 
 
@@ -255,8 +256,7 @@ class TestBatchExtractQuery(unittest.TestCase):
 
         sql = " ".join(query.split())
         # expect a named parameter rather than an inlined literal
-        self.assertIn("WHERE `updated_at` > @bookmark", sql)
-        self.assertIn("`updated_at` IS NULL", sql)
+        self.assertIn("WHERE (`updated_at` > @bookmark) OR `updated_at` IS NULL", sql)
         self.assertNotIn(BOOKMARK, sql)
         # expect the table reference is quoted
         self.assertIn("FROM `mock-schema.mock_table`", sql)
@@ -265,6 +265,35 @@ class TestBatchExtractQuery(unittest.TestCase):
         self.assertEqual(params[0].name, "bookmark")
         self.assertEqual(params[0].type_, "TIMESTAMP")
         self.assertEqual(params[0].value, BOOKMARK)
+
+    def test_watermark_bounds_the_exported_window(self):
+        # given a ceiling read before the export
+        with self.batch_stream() as (stream, _):
+            query, params = stream._build_extract_query(watermark=WATERMARK)
+
+        sql = " ".join(query.split())
+        # expect the export is closed at both ends, so it matches the bookmark
+        # that gets committed afterwards
+        self.assertIn(
+            "WHERE (`updated_at` > @bookmark AND `updated_at` <= @watermark) "
+            "OR `updated_at` IS NULL",
+            sql,
+        )
+        self.assertEqual([p.name for p in params], ["bookmark", "watermark"])
+        self.assertEqual(params[1].value, WATERMARK)
+        self.assertEqual(params[1].type_, "TIMESTAMP")
+
+    def test_first_run_is_still_bounded_by_the_watermark(self):
+        # given no bookmark yet, so this run exports everything up to the ceiling
+        with self.batch_stream(bookmark=None) as (stream, _):
+            query, params = stream._build_extract_query(watermark=WATERMARK)
+
+        sql = " ".join(query.split())
+        self.assertIn(
+            "WHERE (`updated_at` <= @watermark) OR `updated_at` IS NULL",
+            sql,
+        )
+        self.assertEqual([p.name for p in params], ["watermark"])
 
     def test_parameter_type_matches_a_date_replication_key(self):
         # given a DATE replication key, which BigQuery will not compare to a TIMESTAMP
@@ -296,20 +325,25 @@ class TestBatchExtractQuery(unittest.TestCase):
         self.assertNotIn("WHERE", query)
         self.assertEqual(params, [])
 
-    def test_watermark_query_is_quoted(self):
+    def test_stats_query_reads_ceiling_and_null_count_in_one_job(self):
         with self.batch_stream() as (stream, _):
             client = mock.MagicMock()
-            client.query.return_value.result.return_value = [{"watermark": "2026-06-01"}]
+            client.query.return_value.result.return_value = [
+                {"watermark": WATERMARK, "null_keys": 3},
+            ]
             stream.__dict__["client"] = client
 
-            watermark = stream._get_replication_key_watermark()
+            watermark, null_keys = stream._read_replication_key_stats()
 
         query = " ".join(client.query.call_args.args[0].split())
         self.assertEqual(
             query,
-            "SELECT MAX(`updated_at`) AS watermark FROM `mock-schema.mock_table`",
+            "SELECT MAX(`updated_at`) AS watermark, "
+            "COUNTIF(`updated_at` IS NULL) AS null_keys "
+            "FROM `mock-schema.mock_table`",
         )
-        self.assertEqual(watermark, "2026-06-01")
+        self.assertEqual(watermark, WATERMARK)
+        self.assertEqual(null_keys, 3)
 
     def test_get_batches_advances_the_bookmark_after_a_successful_export(self):
         # _sync_batches never calls _increment_stream_state, so without this the
@@ -320,7 +354,7 @@ class TestBatchExtractQuery(unittest.TestCase):
         with self.batch_stream() as (stream, _):
             client = mock.MagicMock()
             client.query.return_value.result.return_value = [
-                {"watermark": "2026-06-01T00:00:00+00:00"},
+                {"watermark": WATERMARK, "null_keys": 0},
             ]
             stream.__dict__["client"] = client
 
@@ -332,7 +366,7 @@ class TestBatchExtractQuery(unittest.TestCase):
 
         self.assertEqual(len(batches), 1)
         increment.assert_called_once_with(
-            {"updated_at": "2026-06-01T00:00:00+00:00"},
+            {"updated_at": WATERMARK},
             context=None,
         )
         # expect the export ran with the bookmark bound as a query parameter
@@ -345,7 +379,9 @@ class TestBatchExtractQuery(unittest.TestCase):
 
         with self.batch_stream() as (stream, _):
             client = mock.MagicMock()
-            client.query.return_value.result.return_value = [{"watermark": None}]
+            client.query.return_value.result.return_value = [
+                {"watermark": None, "null_keys": 0},
+            ]
             stream.__dict__["client"] = client
 
             with mock.patch("tap_bigquery.client.GCSFileSystem"), mock.patch(
@@ -366,3 +402,32 @@ class TestQuoteIdentifier(unittest.TestCase):
     def test_rejects_a_backtick(self):
         with self.assertRaises(ValueError):
             quote_identifier("updated_at` OR TRUE OR `x")
+
+
+class TestNullReplicationKeyWarning(unittest.TestCase):
+    """Test class for surfacing rows that can never advance the bookmark."""
+
+    columns = [
+        {"name": "id", "type": String(50)},
+        {"name": "updated_at", "type": TIMESTAMP()},
+    ]
+
+    def test_warns_once_with_a_count(self):
+        # given rows that carry no replication key
+        with mock_stream(self.columns) as (stream, _):
+            with self.assertLogs(stream.logger, level="WARNING") as logs:
+                stream._warn_about_null_replication_keys(7)
+
+        # expect a single warning naming the count and the column, so the data
+        # quality problem is visible rather than silently re-extracted
+        self.assertEqual(len(logs.records), 1)
+        message = logs.records[0].getMessage()
+        self.assertIn("7 row(s)", message)
+        self.assertIn("updated_at", message)
+
+    def test_silent_when_there_are_none(self):
+        with mock_stream(self.columns) as (stream, _):
+            with mock.patch.object(stream.logger, "warning") as warn:
+                stream._warn_about_null_replication_keys(0)
+
+        warn.assert_not_called()
