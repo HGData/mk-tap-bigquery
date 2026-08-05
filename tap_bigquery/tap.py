@@ -24,6 +24,8 @@ class TapBigQuery(SQLTap):
             "auth_type",
             th.StringType,
             required=False,
+            default="service_account",
+            allowed_values=["service_account", "oauth"],
             description=(
                 "Authentication type: 'service_account' (default) or 'oauth'. "
                 "For service_account, provide google_application_credentials. "
@@ -89,12 +91,13 @@ class TapBigQuery(SQLTap):
             th.StringType,
             required=False,
             description=(
-                "Name of a TIMESTAMP column to use as the replication key for "
-                "incremental extraction (e.g. 'updated_at'). When set, the tap "
-                "extracts only records where this column > the last bookmark, "
-                "plus records where it is NULL. If not set, the tap auto-detects "
-                "from well-known column names (updated_at, modified_at, etc.) or "
-                "falls back to FULL_TABLE."
+                "Name of a TIMESTAMP, DATETIME or DATE column to use as the "
+                "replication key for incremental extraction (e.g. 'updated_at'). "
+                "When set, the tap extracts only records where this column > the "
+                "last bookmark, plus records where it is NULL. Ignored if the "
+                "column is absent or not one of those types. If not set, the tap "
+                "auto-detects from well-known column names (updated_at, "
+                "modified_at, etc.) or falls back to FULL_TABLE."
             ),
         ),
     ).to_dict()

@@ -77,15 +77,70 @@ class TestCreateBigQueryClient(unittest.TestCase):
         )
 
     def test_service_account_is_the_default_auth_type(self, mock_bigquery):
-        # given no auth_type configured
+        # given no auth_type configured at all
         conn = connector(google_application_credentials="/tmp/creds.json")
-        # when a client is created with the default auth_type
-        conn._create_bigquery_client("service_account")
+        self.assertNotIn("auth_type", conn.config)
+
+        # when the engine resolves the mode itself, rather than being told
+        with mock.patch("sqlalchemy.create_engine") as create_engine:
+            conn.create_engine()
 
         # expect service account handling, including the path fallback
         mock_bigquery.Client.from_service_account_json.assert_called_once_with(
             "/tmp/creds.json",
             project="mock-project",
+        )
+        # and expect that client is the one handed to SQLAlchemy
+        self.assertEqual(
+            create_engine.call_args.kwargs["connect_args"]["client"],
+            mock_bigquery.Client.from_service_account_json.return_value,
+        )
+
+    def test_unsupported_auth_type_raises(self, mock_bigquery):  # noqa: ARG002
+        # given a typo in auth_type, which must not silently use ambient credentials
+        conn = connector(auth_type="oauth2", google_application_credentials="{}")
+
+        # when a client is created, expect a clear error
+        with self.assertRaises(ValueError) as ctx:
+            conn._create_bigquery_client("oauth2")
+
+        self.assertIn("oauth2", str(ctx.exception))
+
+    def test_oauth_scopes_bigquery_only_without_a_bucket(self, mock_bigquery):
+        # given oauth with no batch bucket configured
+        conn = connector(
+            auth_type="oauth",
+            client_id="mock-client-id",
+            client_secret="mock-client-secret",
+            refresh_token="mock-refresh-token",
+        )
+        # when a client is created
+        conn._create_bigquery_client("oauth")
+
+        # expect no Cloud Storage scope is requested
+        credentials = mock_bigquery.Client.call_args.kwargs["credentials"]
+        self.assertEqual(
+            list(credentials.scopes),
+            ["https://www.googleapis.com/auth/bigquery"],
+        )
+
+    def test_oauth_adds_storage_scope_for_batch_extracts(self, mock_bigquery):
+        # given oauth with a batch bucket, which the batch path reads and deletes from
+        conn = connector(
+            auth_type="oauth",
+            client_id="mock-client-id",
+            client_secret="mock-client-secret",
+            refresh_token="mock-refresh-token",
+            google_storage_bucket="mock-bucket",
+        )
+        # when a client is created
+        conn._create_bigquery_client("oauth")
+
+        # expect the Cloud Storage scope is requested too
+        credentials = mock_bigquery.Client.call_args.kwargs["credentials"]
+        self.assertIn(
+            "https://www.googleapis.com/auth/devstorage.read_write",
+            credentials.scopes,
         )
 
     def test_oauth_builds_refreshable_credentials(self, mock_bigquery):

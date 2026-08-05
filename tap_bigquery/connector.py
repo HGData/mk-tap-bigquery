@@ -27,6 +27,20 @@ if t.TYPE_CHECKING:
     from sqlalchemy.engine import Engine
     from sqlalchemy.engine.reflection import Inspector
 
+SUPPORTED_AUTH_TYPES = frozenset({"service_account", "oauth"})
+
+# Column names preferred as the replication key, most preferred first.
+PREFERRED_REPLICATION_KEYS = (
+    "updated_at",
+    "modified_at",
+    "last_modified",
+    "_sdc_batched_at",
+    "created_at",
+)
+
+# Reflected column types usable as a replication key.
+REPLICATION_KEY_TYPES = frozenset({"TIMESTAMP", "DATETIME", "DATE"})
+
 
 class BigQueryConnector(SQLConnector):
     """Connects to the BigQuery SQL source."""
@@ -43,8 +57,10 @@ class BigQueryConnector(SQLConnector):
         logic.
 
         Supports two auth modes (controlled by auth_type config):
-        - service_account (default): uses google_application_credentials
-        - oauth: uses access_token passed from Argo via DAG env vars
+        - service_account (default): uses google_application_credentials, which
+          holds either the key JSON itself or a path to a key file
+        - oauth: builds refresh-capable credentials from client_id,
+          client_secret and refresh_token
 
         Returns:
             A new SQLAlchemy Engine.
@@ -70,9 +86,20 @@ class BigQueryConnector(SQLConnector):
           either the key JSON itself or a path to a key file.
         - Falls back to Application Default Credentials if nothing is configured.
 
+        Raises:
+            ValueError: If auth_type is not a supported mode.
+            RuntimeError: If auth_type is 'oauth' but a required setting is missing.
+
         Returns:
             Authenticated BigQuery client.
         """
+        if auth_type not in SUPPORTED_AUTH_TYPES:
+            msg = (
+                f"Unsupported auth_type '{auth_type}'. Expected one of: "
+                f"{', '.join(sorted(SUPPORTED_AUTH_TYPES))}."
+            )
+            raise ValueError(msg)
+
         project_id = self.config["project_id"]
 
         if auth_type == "oauth":
@@ -85,13 +112,18 @@ class BigQueryConnector(SQLConnector):
                     "when auth_type is 'oauth'"
                 )
                 raise RuntimeError(msg)
+            # The batch extract path reuses these credentials for Cloud Storage
+            # (see BigQueryStream.get_batches), which needs its own scope.
+            scopes = ["https://www.googleapis.com/auth/bigquery"]
+            if self.config.get("google_storage_bucket"):
+                scopes.append("https://www.googleapis.com/auth/devstorage.read_write")
             oauth_creds = OAuthCredentials(
                 token=None,
                 refresh_token=refresh_token,
                 token_uri="https://oauth2.googleapis.com/token",
                 client_id=client_id,
                 client_secret=client_secret,
-                scopes=["https://www.googleapis.com/auth/bigquery"],
+                scopes=scopes,
             )
             return bigquery.Client(project=project_id, credentials=oauth_creds)
 
@@ -111,8 +143,11 @@ class BigQueryConnector(SQLConnector):
                     creds_dict = parsed
 
             if creds_dict is None:
-                self.logger.warning(
-                    "'google_application_credentials' not valid json trying path",
+                # Expected for the documented "path to a key file" form, so this
+                # is a branch-selection detail rather than a problem.
+                self.logger.debug(
+                    "'google_application_credentials' is not JSON, treating it as "
+                    "a path to a service account key file",
                 )
                 return bigquery.Client.from_service_account_json(
                     credentials,
@@ -232,7 +267,12 @@ class BigQueryConnector(SQLConnector):
 
             for table_name, is_view in object_names:
                 catalog_entry = self.discover_catalog_entry(
-                    engine, inspected, schema_name, table_name, is_view,
+                    engine,
+                    inspected,
+                    schema_name,
+                    table_name,
+                    is_view,
+                    reflect_indices=reflect_indices,
                 )
                 result.append(catalog_entry.to_dict())
 
@@ -245,6 +285,8 @@ class BigQueryConnector(SQLConnector):
         schema_name: str,
         table_name: str,
         is_view: bool,  # noqa: FBT001
+        *,
+        reflect_indices: bool = True,
     ) -> CatalogEntry:
         """Create `CatalogEntry` object for the given table or a view.
 
@@ -254,6 +296,7 @@ class BigQueryConnector(SQLConnector):
             schema_name: Schema name to inspect
             table_name: Name of the table or a view
             is_view: Flag whether this object is a view, returned by `get_object_names`
+            reflect_indices: Whether to reflect indexes to detect unique keys
 
         Returns:
             `CatalogEntry` object for the given table or a view
@@ -269,11 +312,12 @@ class BigQueryConnector(SQLConnector):
 
         # An element of the columns list is ``None`` if it's an expression and is
         # returned in the ``expressions`` list of the reflected index.
-        possible_primary_keys.extend(
-            index_def["column_names"]  # type: ignore[misc]
-            for index_def in inspected.get_indexes(table_name, schema=schema_name)
-            if index_def.get("unique", False)
-        )
+        if reflect_indices:
+            possible_primary_keys.extend(
+                index_def["column_names"]  # type: ignore[misc]
+                for index_def in inspected.get_indexes(table_name, schema=schema_name)
+                if index_def.get("unique", False)
+            )
 
         key_properties = next(iter(possible_primary_keys), None)
 
@@ -295,7 +339,7 @@ class BigQueryConnector(SQLConnector):
                     ),
                 )
                 type_name = type(col_type).__name__.upper()
-                if type_name in ("TIMESTAMP", "DATETIME", "DATE"):
+                if type_name in REPLICATION_KEY_TYPES:
                     timestamp_columns.append(column_name)
         schema = table_schema.to_dict()
 
@@ -311,12 +355,17 @@ class BigQueryConnector(SQLConnector):
             if configured_key and configured_key in timestamp_columns:
                 replication_key = configured_key
             else:
+                if configured_key:
+                    self.logger.warning(
+                        "Configured replication_key_column '%s' is not a "
+                        "%s column on '%s.%s'; falling back to auto-detection",
+                        configured_key,
+                        "/".join(sorted(REPLICATION_KEY_TYPES)),
+                        schema_name,
+                        table_name,
+                    )
                 # Auto-detect: prefer well-known column names
-                preferred = [
-                    "updated_at", "modified_at", "last_modified",
-                    "_sdc_batched_at", "created_at",
-                ]
-                for name in preferred:
+                for name in PREFERRED_REPLICATION_KEYS:
                     if name in timestamp_columns:
                         replication_key = name
                         break

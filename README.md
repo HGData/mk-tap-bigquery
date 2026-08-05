@@ -87,6 +87,13 @@ credentials, so access tokens are obtained and renewed automatically for the lif
 the refresh token — no pre-fetched access token is needed. All three settings are
 required in this mode; if any is missing the tap fails at startup with a clear error.
 
+The authenticated principal needs the same permissions as a service account:
+`roles/bigquery.dataViewer` on the datasets being read and `roles/bigquery.jobUser` on
+the project, plus read and delete on the bucket when `google_storage_bucket` is set. The
+tap requests the `bigquery` scope, and adds `devstorage.read_write` when a bucket is
+configured — the refresh token must already have been granted the scopes it needs, since
+scopes cannot be widened at refresh time.
+
 ```json
 {
   "project_id": "my-gcp-project",
@@ -105,10 +112,18 @@ Streams replicate incrementally when a TIMESTAMP replication key is available, a
 The key is chosen at discovery time, per table:
 
 1. If `replication_key_column` is set and that column exists on the table as a
-   TIMESTAMP/DATETIME/DATE column, it is used.
+   TIMESTAMP, DATETIME or DATE column, it is used.
 2. Otherwise the tap auto-detects, preferring, in order:
    `updated_at`, `modified_at`, `last_modified`, `_sdc_batched_at`, `created_at`.
-3. If the table has no timestamp column at all, the stream is `FULL_TABLE`.
+3. Otherwise the stream is `FULL_TABLE`. Note this includes tables that *do* have
+   timestamp columns, none of which carries one of those five names — an arbitrary
+   timestamp column is never picked. Every timestamp column is still advertised in
+   `valid-replication-keys`, so a key can be chosen in the catalog, and
+   `replication_key_column` can name one directly.
+
+A replication key reaches the stream through the catalog, so incremental extraction
+applies when the tap runs with a catalog (as Meltano does) rather than on a bare
+`--discover`.
 
 Incremental extracts filter with a **strict** `>` against the bookmark, plus rows whose
 key is NULL:
@@ -125,7 +140,16 @@ window. Rows with a NULL replication key are re-emitted on every run, so downstr
 de-duplication should be in place.
 
 The same filter is applied on both extract paths: the row-by-row path and the
-`EXPORT DATA` path used when `google_storage_bucket` is set.
+`EXPORT DATA` path used when `google_storage_bucket` is set. The bookmark is always
+bound as a query parameter typed from the column itself, so a DATE or DATETIME key is
+compared against a matching literal rather than a TIMESTAMP, which BigQuery rejects.
+
+On the batch path the tap reads `MAX(<key>)` before exporting and commits it as the new
+bookmark only once the export and download have succeeded. The SDK does not advance
+bookmarks for `BATCH` streams on its own, so without this every run would re-export the
+same delta. Because the watermark is read before the export, rows committed in between
+are exported and then exported again on the next run — at-least-once, which downstream
+de-duplication absorbs.
 
 ## Usage
 

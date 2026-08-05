@@ -17,10 +17,31 @@ from google.cloud import bigquery
 from singer_sdk import SQLStream
 from singer_sdk.helpers._batch import JSONLinesEncoding
 
-from tap_bigquery.connector import BigQueryConnector
+from tap_bigquery.connector import REPLICATION_KEY_TYPES, BigQueryConnector
 
 if TYPE_CHECKING:
     from singer_sdk.helpers import types
+
+# Name of the named query parameter carrying the incremental bookmark.
+BOOKMARK_PARAMETER = "bookmark"
+
+
+def quote_identifier(name: str) -> str:
+    """Backtick-quote a BigQuery identifier.
+
+    Args:
+        name: Identifier to quote.
+
+    Raises:
+        ValueError: If the identifier itself contains a backtick.
+
+    Returns:
+        The quoted identifier.
+    """
+    if "`" in name:
+        msg = f"Invalid BigQuery identifier: {name!r}"
+        raise ValueError(msg)
+    return f"`{name}`"
 
 
 class BigQueryStream(SQLStream):
@@ -102,23 +123,66 @@ class BigQueryStream(SQLStream):
             return
 
         self.logger.info(
-            "Incremental extract: %s > '%s'",
+            "Incremental extract: %s > '%s' (or NULL)",
             self.replication_key,
             start_value,
         )
 
-        query = sqlalchemy.text(
-            f"SELECT * FROM {self.fully_qualified_name} "
-            f"WHERE {self.replication_key} > TIMESTAMP('{start_value}') "
-            f"OR {self.replication_key} IS NULL"
-        )
+        query = self._build_incremental_query(start_value)
 
-        with self.connector._engine.connect() as conn:
-            for row in conn.execute(query):
-                record = dict(row._mapping)
-                transformed = self.post_process(record, context)
+        # _connect() is what applies stream_results=True, so results are not
+        # buffered in memory for large extracts.
+        with self.connector._connect() as conn:  # noqa: SLF001
+            for record in conn.execute(query).mappings():
+                transformed = self.post_process(dict(record), context)
                 if transformed is not None:
                     yield transformed
+
+    def _build_incremental_query(self, start_value):
+        """Build the SELECT for an incremental row-by-row extract.
+
+        Mirrors singer-sdk's ``SQLStream.get_records``: selected columns only, and
+        ordered by the replication key, since ``is_sorted`` is True for INCREMENTAL
+        streams and unordered rows would raise ``InvalidStreamSortException``. The
+        only differences are the strict ``>`` and the NULL-key rows.
+
+        The bookmark is bound as a parameter typed from the column itself, so a
+        DATE or DATETIME key is compared against a matching literal rather than a
+        TIMESTAMP, which BigQuery would reject.
+
+        Args:
+            start_value: The replication key bookmark to filter on.
+
+        Returns:
+            A SQLAlchemy select statement.
+        """
+        table = self.connector.get_table(
+            full_table_name=self.fully_qualified_name,
+            column_names=list(self.get_selected_schema()["properties"].keys()),
+        )
+        replication_key_col = table.columns[self.replication_key]
+        order_by = (
+            sqlalchemy.nulls_first(replication_key_col.asc())
+            if self.supports_nulls_first
+            else replication_key_col.asc()
+        )
+        query = (
+            table.select()
+            .where(
+                sqlalchemy.or_(
+                    replication_key_col > start_value,
+                    replication_key_col.is_(None),
+                ),
+            )
+            .order_by(order_by)
+        )
+
+        if self.ABORT_AT_RECORD_COUNT is not None:
+            # Limit record count to one greater than the abort threshold, so
+            # MaxRecordsLimitException is still raised by the caller.
+            query = query.limit(self.ABORT_AT_RECORD_COUNT + 1)
+
+        return query
 
     def get_batch_config(self, config):
         return config.get("google_storage_bucket")
@@ -126,22 +190,25 @@ class BigQueryStream(SQLStream):
     def get_batches(self, bucket: str, context):
         destination_uri = f"gs://{bucket}/{self.fully_qualified_name}-*.json.gz"
 
-        job_config = bigquery.ExtractJobConfig()
-        job_config.destination_format = (
-            bigquery.DestinationFormat.NEWLINE_DELIMITED_JSON
-        )
-        job_config.compression = bigquery.Compression.GZIP
-
         self.logger.info(
             "Running extract job from table '%s' to bucket '%s'",
             self.fully_qualified_name,
             bucket,
         )
 
-        query = self._build_extract_query()
+        # Capture the ceiling before exporting. Rows committed between this query
+        # and the export still get exported, and will be exported again next run
+        # because the bookmark stays behind them - at-least-once, which downstream
+        # dedup absorbs. Reading the watermark afterwards could skip rows instead.
+        watermark = self._get_replication_key_watermark()
+
+        query, query_parameters = self._build_extract_query()
         self.logger.debug(query)
 
-        extract_job = self.client.query(query)
+        extract_job = self.client.query(
+            query,
+            job_config=bigquery.QueryJobConfig(query_parameters=query_parameters),
+        )
 
         try:
             extract_job.result()  # Waits for job to complete.
@@ -176,26 +243,79 @@ class BigQueryStream(SQLStream):
             [str(f) for f in files],
         )
 
+        # _sync_batches emits a STATE message after each batch it receives, but it
+        # never calls _increment_stream_state, so without this the bookmark would
+        # never advance and every run would re-export the same delta. Advancing
+        # here means it only happens once the export and download have succeeded.
+        if watermark is not None:
+            self._increment_stream_state(
+                {self.replication_key: watermark},
+                context=context,
+            )
+
         yield JSONLinesEncoding("gzip"), [f.as_uri() for f in files]
 
+    def _replication_key_parameter_type(self) -> str:
+        """Return the BigQuery parameter type matching the replication key column.
+
+        BigQuery rejects ``DATE > TIMESTAMP`` and ``DATETIME > TIMESTAMP``, so the
+        bound bookmark has to carry the column's own type.
+
+        Returns:
+            One of the types in ``REPLICATION_KEY_TYPES``.
+        """
+        table = self.connector.get_table(full_table_name=self.fully_qualified_name)
+        type_name = type(table.columns[self.replication_key].type).__name__.upper()
+        return type_name if type_name in REPLICATION_KEY_TYPES else "TIMESTAMP"
+
+    def _get_replication_key_watermark(self):
+        """Return MAX(replication_key) for the table, or None.
+
+        Returns:
+            The highest replication key value present, or None when the stream is
+            not incremental or the table holds no non-NULL values.
+        """
+        if not self.replication_key:
+            return None
+
+        query = (
+            f"SELECT MAX({quote_identifier(self.replication_key)}) AS watermark "
+            f"FROM {quote_identifier(self.fully_qualified_name)}"
+        )
+        rows = list(self.client.query(query).result())
+        return rows[0]["watermark"] if rows else None
+
     def _build_extract_query(self):
+        """Build the EXPORT DATA statement and its query parameters.
+
+        Returns:
+            A tuple of the SQL statement and the list of query parameters it binds.
+        """
         expressions = _generate_property_expressions(
             self.get_selected_schema()["properties"],
         )
 
         where_clause = ""
+        query_parameters: list = []
         if self.replication_key:
             start_value = self.get_starting_replication_key_value(None)
             if start_value:
                 self.logger.info(
-                    "Incremental extract: %s > '%s'",
+                    "Incremental extract: %s > '%s' (or NULL)",
                     self.replication_key,
                     start_value,
                 )
+                column = quote_identifier(self.replication_key)
                 where_clause = (
-                    f"WHERE {self.replication_key} > "
-                    f"TIMESTAMP('{start_value}') "
-                    f"OR {self.replication_key} IS NULL"
+                    f"WHERE {column} > @{BOOKMARK_PARAMETER} "
+                    f"OR {column} IS NULL"
+                )
+                query_parameters.append(
+                    bigquery.ScalarQueryParameter(
+                        BOOKMARK_PARAMETER,
+                        self._replication_key_parameter_type(),
+                        start_value,
+                    ),
                 )
 
         query = """
@@ -208,16 +328,20 @@ class BigQueryStream(SQLStream):
             )
         AS (
             SELECT {expressions}
-            FROM {table}
+            FROM {quoted_table}
             {where_clause}
         )
         """
 
-        return query.format(
-            bucket=self.config["google_storage_bucket"],
-            table=self.fully_qualified_name,
-            expressions=", ".join(expressions),
-            where_clause=where_clause,
+        return (
+            query.format(
+                bucket=self.config["google_storage_bucket"],
+                table=self.fully_qualified_name,
+                quoted_table=quote_identifier(self.fully_qualified_name),
+                expressions=", ".join(expressions),
+                where_clause=where_clause,
+            ),
+            query_parameters,
         )
 
 
