@@ -1,4 +1,4 @@
-"""A sample implementation for BigQuery."""
+"""BigQuery connector implementation."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import json
 import typing as t
 
 import sqlalchemy
+from google.cloud import bigquery
+from google.oauth2.credentials import Credentials as OAuthCredentials
 from singer_sdk import SQLConnector
 from singer_sdk import typing as th  # JSON schema typing helpers
 from singer_sdk._singerlib import CatalogEntry, MetadataMapping, Schema
@@ -25,6 +27,20 @@ if t.TYPE_CHECKING:
     from sqlalchemy.engine import Engine
     from sqlalchemy.engine.reflection import Inspector
 
+SUPPORTED_AUTH_TYPES = frozenset({"service_account", "oauth"})
+
+# Column names preferred as the replication key, most preferred first.
+PREFERRED_REPLICATION_KEYS = (
+    "updated_at",
+    "modified_at",
+    "last_modified",
+    "_sdc_batched_at",
+    "created_at",
+)
+
+# Reflected column types usable as a replication key.
+REPLICATION_KEY_TYPES = frozenset({"TIMESTAMP", "DATETIME", "DATE"})
+
 
 class BigQueryConnector(SQLConnector):
     """Connects to the BigQuery SQL source."""
@@ -40,42 +56,112 @@ class BigQueryConnector(SQLConnector):
         on their subclass of SQLConnector to perform custom engine creation
         logic.
 
+        Supports two auth modes (controlled by auth_type config):
+        - service_account (default): uses google_application_credentials, which
+          holds either the key JSON itself or a path to a key file
+        - oauth: builds refresh-capable credentials from client_id,
+          client_secret and refresh_token
+
         Returns:
             A new SQLAlchemy Engine.
         """
-        credentials : str | dict = self.config.get("google_application_credentials")
+        auth_type = self.config.get("auth_type", "service_account")
+
+        bq_client = self._create_bigquery_client(auth_type)
+        url = self.sqlalchemy_url + "?user_supplied_client=true"
+        return sqlalchemy.create_engine(
+            url,
+            echo=False,
+            connect_args={"client": bq_client},
+        )
+
+    def _create_bigquery_client(self, auth_type: str) -> bigquery.Client:
+        """Create a BigQuery client based on auth_type.
+
+        Auth modes:
+        - oauth: Uses client_id, client_secret, refresh_token to obtain
+          and auto-refresh access tokens. Same pattern as mk-tap-salesforce
+          and mk-tap-hubspot.
+        - service_account: Uses google_application_credentials, which may hold
+          either the key JSON itself or a path to a key file.
+        - Falls back to Application Default Credentials if nothing is configured.
+
+        Raises:
+            ValueError: If auth_type is not a supported mode.
+            RuntimeError: If auth_type is 'oauth' but a required setting is missing.
+
+        Returns:
+            Authenticated BigQuery client.
+        """
+        if auth_type not in SUPPORTED_AUTH_TYPES:
+            msg = (
+                f"Unsupported auth_type '{auth_type}'. Expected one of: "
+                f"{', '.join(sorted(SUPPORTED_AUTH_TYPES))}."
+            )
+            raise ValueError(msg)
+
+        project_id = self.config["project_id"]
+
+        if auth_type == "oauth":
+            client_id = self.config.get("client_id")
+            client_secret = self.config.get("client_secret")
+            refresh_token = self.config.get("refresh_token")
+            if not all([client_id, client_secret, refresh_token]):
+                msg = (
+                    "client_id, client_secret, and refresh_token are all required "
+                    "when auth_type is 'oauth'"
+                )
+                raise RuntimeError(msg)
+            # The batch extract path reuses these credentials for Cloud Storage
+            # (see BigQueryStream.get_batches), which needs its own scope.
+            scopes = ["https://www.googleapis.com/auth/bigquery"]
+            if self.config.get("google_storage_bucket"):
+                scopes.append("https://www.googleapis.com/auth/devstorage.read_write")
+            oauth_creds = OAuthCredentials(
+                token=None,
+                refresh_token=refresh_token,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=client_id,
+                client_secret=client_secret,
+                scopes=scopes,
+            )
+            return bigquery.Client(project=project_id, credentials=oauth_creds)
+
+        credentials: str | dict = self.config.get("google_application_credentials")
 
         if credentials:
-            try:
-                return sqlalchemy.create_engine(
-                    self.sqlalchemy_url,
-                    echo=False,
-                    credentials_info=(
-                        json.loads(credentials)
-                        if isinstance(credentials, str)
-                        else credentials
-                    ),
-                    # json_serializer=self.serialize_json,
-                    # json_deserializer=self.deserialize_json,
+            creds_dict: dict | None = None
+
+            if isinstance(credentials, dict):
+                creds_dict = credentials
+            else:
+                try:
+                    parsed = json.loads(credentials)
+                except (TypeError, json.decoder.JSONDecodeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    creds_dict = parsed
+
+            if creds_dict is None:
+                # Expected for the documented "path to a key file" form, so this
+                # is a branch-selection detail rather than a problem.
+                self.logger.debug(
+                    "'google_application_credentials' is not JSON, treating it as "
+                    "a path to a service account key file",
                 )
-            except (TypeError, json.decoder.JSONDecodeError):
-                self.logger.warning(
-                    "'google_application_credentials' not valid json trying path",
+                return bigquery.Client.from_service_account_json(
+                    credentials,
+                    project=project_id,
                 )
-                return sqlalchemy.create_engine(
-                    self.sqlalchemy_url,
-                    echo=False,
-                    credentials_path=credentials,
-                    # json_serializer=self.serialize_json,
-                    # json_deserializer=self.deserialize_json,
-                )
-        else:
-            return sqlalchemy.create_engine(
-                self.sqlalchemy_url,
-                echo=False,
-                # json_serializer=self.serialize_json,
-                # json_deserializer=self.deserialize_json,
+
+            creds_dict.setdefault("type", "service_account")
+            creds_dict.setdefault("token_uri", "https://oauth2.googleapis.com/token")
+            return bigquery.Client.from_service_account_info(
+                creds_dict,
+                project=project_id,
             )
+
+        return bigquery.Client(project=project_id)
 
     def to_array_type(
         self,
@@ -157,9 +243,41 @@ class BigQueryConnector(SQLConnector):
             return jsonschema.type_dict
         return super().to_jsonschema_type(sql_type)
 
-    # TODO this only needs a column filtering capability in the singer-sdk
-    # as sqlalchemy returns additional columns on bigquery for all the json
-    # it has natively understood.
+    def discover_catalog_entries(
+        self,
+        *,
+        exclude_schemas: t.Sequence[str] = (),
+        reflect_indices: bool = True,
+    ) -> list[dict]:
+        """Override to avoid get_multi_columns which breaks with user_supplied_client.
+
+        sqlalchemy-bigquery's get_multi_columns uses the schema name as
+        the project in the API URL, causing 400 errors. This override
+        uses per-table get_columns which resolves the project correctly.
+        """
+        result: list[dict] = []
+        engine = self._engine
+        inspected = sqlalchemy.inspect(engine)
+
+        for schema_name in self.get_schema_names(engine, inspected):
+            if schema_name in exclude_schemas:
+                continue
+
+            object_names = self.get_object_names(engine, inspected, schema_name)
+
+            for table_name, is_view in object_names:
+                catalog_entry = self.discover_catalog_entry(
+                    engine,
+                    inspected,
+                    schema_name,
+                    table_name,
+                    is_view,
+                    reflect_indices=reflect_indices,
+                )
+                result.append(catalog_entry.to_dict())
+
+        return result
+
     def discover_catalog_entry(
         self,
         engine: Engine,  # noqa: ARG002
@@ -167,6 +285,8 @@ class BigQueryConnector(SQLConnector):
         schema_name: str,
         table_name: str,
         is_view: bool,  # noqa: FBT001
+        *,
+        reflect_indices: bool = True,
     ) -> CatalogEntry:
         """Create `CatalogEntry` object for the given table or a view.
 
@@ -176,6 +296,7 @@ class BigQueryConnector(SQLConnector):
             schema_name: Schema name to inspect
             table_name: Name of the table or a view
             is_view: Flag whether this object is a view, returned by `get_object_names`
+            reflect_indices: Whether to reflect indexes to detect unique keys
 
         Returns:
             `CatalogEntry` object for the given table or a view
@@ -191,20 +312,23 @@ class BigQueryConnector(SQLConnector):
 
         # An element of the columns list is ``None`` if it's an expression and is
         # returned in the ``expressions`` list of the reflected index.
-        possible_primary_keys.extend(
-            index_def["column_names"]  # type: ignore[misc]
-            for index_def in inspected.get_indexes(table_name, schema=schema_name)
-            if index_def.get("unique", False)
-        )
+        if reflect_indices:
+            possible_primary_keys.extend(
+                index_def["column_names"]  # type: ignore[misc]
+                for index_def in inspected.get_indexes(table_name, schema=schema_name)
+                if index_def.get("unique", False)
+            )
 
         key_properties = next(iter(possible_primary_keys), None)
 
-        # Initialize columns list
+        # Initialize columns list and detect timestamp columns for incremental
         table_schema = th.PropertiesList()
+        timestamp_columns: list[str] = []
         for column_def in inspected.get_columns(table_name, schema=schema_name):
             column_name = column_def["name"]
             is_nullable = column_def.get("nullable", False)
-            jsonschema_type: dict = self.to_jsonschema_type(column_name, column_def["type"])
+            col_type = column_def["type"]
+            jsonschema_type: dict = self.to_jsonschema_type(column_name, col_type)
             if ("." not in column_name):
                 table_schema.append(
                     th.Property(
@@ -214,16 +338,42 @@ class BigQueryConnector(SQLConnector):
                         required=column_name in key_properties if key_properties else False,
                     ),
                 )
+                type_name = type(col_type).__name__.upper()
+                if type_name in REPLICATION_KEY_TYPES:
+                    timestamp_columns.append(column_name)
         schema = table_schema.to_dict()
 
-        # Initialize available replication methods
-        addl_replication_methods: list[str] = [""]  # By default an empty list.
-        # Notes regarding replication methods:
-        # - 'INCREMENTAL' replication must be enabled by the user by specifying
-        #   a replication_key value.
-        # - 'LOG_BASED' replication must be enabled by the developer, according
-        #   to source-specific implementation capabilities.
-        replication_method = next(reversed(["FULL_TABLE", *addl_replication_methods]))
+        # Determine replication method and key.
+        # If the user specified a replication_key_column in config, use it.
+        # Otherwise auto-detect from timestamp columns with well-known names.
+        configured_key = self.config.get("replication_key_column")
+        replication_key: str | None = None
+        valid_replication_keys: list[str] | None = None
+
+        if timestamp_columns:
+            valid_replication_keys = timestamp_columns
+            if configured_key and configured_key in timestamp_columns:
+                replication_key = configured_key
+            else:
+                if configured_key:
+                    self.logger.warning(
+                        "Configured replication_key_column '%s' is not a "
+                        "%s column on '%s.%s'; falling back to auto-detection",
+                        configured_key,
+                        "/".join(sorted(REPLICATION_KEY_TYPES)),
+                        schema_name,
+                        table_name,
+                    )
+                # Auto-detect: prefer well-known column names
+                for name in PREFERRED_REPLICATION_KEYS:
+                    if name in timestamp_columns:
+                        replication_key = name
+                        break
+
+        if replication_key:
+            replication_method = "INCREMENTAL"
+        else:
+            replication_method = "FULL_TABLE"
 
         # Create the catalog entry object
         return CatalogEntry(
@@ -239,12 +389,12 @@ class BigQueryConnector(SQLConnector):
                 schema=schema,
                 replication_method=replication_method,
                 key_properties=key_properties,
-                valid_replication_keys=None,  # Must be defined by user
+                valid_replication_keys=valid_replication_keys,
             ),
             database=None,  # Expects single-database context
             row_count=None,
             stream_alias=None,
-            replication_key=None,  # Must be defined by user
+            replication_key=replication_key,
         )
 
     def get_sqlalchemy_url(self, config: dict) -> str:

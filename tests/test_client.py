@@ -28,6 +28,15 @@ class TestClient(unittest.TestCase):
         # default catalog setup discovers streams
         self.mock_catalog = None
         TestClient.mock_records = []
+        # Building a real bigquery.Client would need real credentials, so stub it
+        # out. Auth selection itself is covered by tests/test_connector_auth.py.
+        patcher = mock.patch.object(
+            BigQueryConnector,
+            "_create_bigquery_client",
+            return_value=mock.MagicMock(),
+        )
+        self.addCleanup(patcher.stop)
+        patcher.start()
 
     @mock.patch("sqlalchemy.create_engine", return_value=create_mock_engine('bigquery://mockprojectid', dump))
     @mock.patch("sqlalchemy.inspect", return_value=MockInspector(
